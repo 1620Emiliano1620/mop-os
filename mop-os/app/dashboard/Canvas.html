@@ -1,0 +1,280 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import {
+  Plus, Search, Bell, Settings, LogOut, Loader2, Check,
+} from "lucide-react";
+import { createClient } from "@/lib/supabase/client";
+import { COLORS } from "@/lib/theme";
+import Logo from "@/components/Logo";
+import CompactCalendar from "@/components/CompactCalendar";
+import ProjectCapsule from "@/components/ProjectCapsule";
+import SidePanel from "@/components/SidePanel";
+import NewProjectModal from "@/components/NewProjectModal";
+
+const BUCKET = "project-files";
+
+export default function Canvas({ user, profile }) {
+  const router = useRouter();
+  const supabase = createClient();
+
+  const [projects, setProjects] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [checklist, setChecklist] = useState([]);
+  const [comments, setComments] = useState([]);
+  const [files, setFiles] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+
+  const [openId, setOpenId] = useState(null);
+  const [showNew, setShowNew] = useState(false);
+  const [search, setSearch] = useState("");
+  const [dragging, setDragging] = useState(null);
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [saveState, setSaveState] = useState("idle");
+
+  const saveTimer = useRef(null);
+  const flashSaved = () => {
+    setSaveState("saving");
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      setSaveState("saved");
+      setTimeout(() => setSaveState("idle"), 1200);
+    }, 250);
+  };
+
+  // ---------- carga inicial ----------
+  useEffect(() => {
+    (async () => {
+      const [{ data: p }, { data: t }, { data: c }, { data: cm }, { data: f }] = await Promise.all([
+        supabase.from("projects").select("*"),
+        supabase.from("tasks").select("*"),
+        supabase.from("checklist_items").select("*"),
+        supabase.from("comments").select("*").order("created_at", { ascending: true }),
+        supabase.from("files").select("*"),
+      ]);
+      setProjects(p || []);
+      setTasks(t || []);
+      setChecklist(c || []);
+      setComments(cm || []);
+      setFiles(f || []);
+      setLoaded(true);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------- tiempo real: cambios de cualquier miembro del equipo ----------
+  useEffect(() => {
+    const applyChange = (setState) => (payload) => {
+      if (payload.eventType === "INSERT") {
+        setState((prev) => (prev.some((r) => r.id === payload.new.id) ? prev : [...prev, payload.new]));
+      } else if (payload.eventType === "UPDATE") {
+        setState((prev) => prev.map((r) => (r.id === payload.new.id ? payload.new : r)));
+      } else if (payload.eventType === "DELETE") {
+        setState((prev) => prev.filter((r) => r.id !== payload.old.id));
+      }
+      flashSaved();
+    };
+
+    const channel = supabase
+      .channel("mop-os-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, applyChange(setProjects))
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, applyChange(setTasks))
+      .on("postgres_changes", { event: "*", schema: "public", table: "checklist_items" }, applyChange(setChecklist))
+      .on("postgres_changes", { event: "*", schema: "public", table: "comments" }, applyChange(setComments))
+      .on("postgres_changes", { event: "*", schema: "public", table: "files" }, applyChange(setFiles))
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------- mutaciones ----------
+  const onUpdateProject = useCallback(async (id, fields) => {
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, ...fields } : p)));
+    flashSaved();
+    await supabase.from("projects").update(fields).eq("id", id);
+  }, [supabase]);
+
+  const onCreateProject = useCallback(async (fields) => {
+    const x = 40 + Math.round(Math.random() * 200);
+    const y = 40 + Math.round(Math.random() * 120);
+    const { data, error } = await supabase
+      .from("projects")
+      .insert({ ...fields, progress: 0, x, y, created_by: user.id })
+      .select()
+      .single();
+    if (!error && data) {
+      setProjects((prev) => [...prev, data]);
+      setShowNew(false);
+      setOpenId(data.id);
+    }
+  }, [supabase, user.id]);
+
+  const onDrag = (id, x, y) => {
+    setDragging(id);
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, x, y } : p)));
+  };
+  const onDragEnd = async (id) => {
+    setDragging(null);
+    const p = projects.find((pr) => pr.id === id);
+    if (p) {
+      flashSaved();
+      await supabase.from("projects").update({ x: p.x, y: p.y }).eq("id", id);
+    }
+  };
+
+  const onAddTask = useCallback(async (projectId) => {
+    const project = projects.find((p) => p.id === projectId);
+    const { data } = await supabase.from("tasks").insert({
+      project_id: projectId, name: "Nueva tarea", responsible: project?.responsible || "",
+      priority: "Media", due_date: project?.delivery_date || null, status: "Pendiente", progress: 0,
+    }).select().single();
+    if (data) setTasks((prev) => [...prev, data]);
+  }, [supabase, projects]);
+
+  const onUpdateTask = useCallback(async (taskId, fields) => {
+    setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, ...fields } : t)));
+    flashSaved();
+    await supabase.from("tasks").update(fields).eq("id", taskId);
+  }, [supabase]);
+
+  const onAddChecklistItem = useCallback(async (projectId, text) => {
+    const { data } = await supabase.from("checklist_items").insert({ project_id: projectId, text, done: false }).select().single();
+    if (data) setChecklist((prev) => [...prev, data]);
+  }, [supabase]);
+
+  const onToggleChecklistItem = useCallback(async (itemId, done) => {
+    setChecklist((prev) => prev.map((c) => (c.id === itemId ? { ...c, done } : c)));
+    flashSaved();
+    await supabase.from("checklist_items").update({ done }).eq("id", itemId);
+  }, [supabase]);
+
+  const onAddComment = useCallback(async (projectId, author, text) => {
+    const { data } = await supabase.from("comments").insert({ project_id: projectId, author, text }).select().single();
+    if (data) setComments((prev) => [...prev, data]);
+  }, [supabase]);
+
+  const onUploadFile = useCallback(async (projectId, file, kind) => {
+    const path = `${projectId}/${Date.now()}_${file.name}`;
+    const { error: upErr } = await supabase.storage.from(BUCKET).upload(path, file);
+    if (upErr) return;
+    const { data } = await supabase.from("files").insert({ project_id: projectId, name: file.name, kind, storage_path: path }).select().single();
+    if (data) setFiles((prev) => [...prev, data]);
+  }, [supabase]);
+
+  const fileUrl = (storagePath) => supabase.storage.from(BUCKET).getPublicUrl(storagePath).data.publicUrl;
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    router.push("/");
+    router.refresh();
+  };
+
+  const filtered = projects.filter((p) => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return [p.name, p.client, p.city, p.responsible].some((v) => (v || "").toLowerCase().includes(q));
+  });
+
+  const openProject = projects.find((p) => p.id === openId);
+  const canvasHeight = Math.max(560, ...(projects.length ? projects.map((p) => p.y + 220) : [560]));
+
+  return (
+    <div style={{ minHeight: "100vh", background: COLORS.bg }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 26px", borderBottom: `1px solid ${COLORS.line}`, background: COLORS.surface, position: "sticky", top: 0, zIndex: 30, gap: 16, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
+          <Logo size={28} />
+          <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 16, color: COLORS.ink }}>MOP OS</div>
+        </div>
+
+        <div style={{ position: "relative", flex: 1, maxWidth: 380, minWidth: 160 }}>
+          <Search size={15} color={COLORS.inkSoft} style={{ position: "absolute", left: 12, top: 9 }} />
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar proyectos, clientes, ciudades..."
+            style={{ width: "100%", boxSizing: "border-box", padding: "8px 12px 8px 34px", borderRadius: 9, border: `1px solid ${COLORS.line}`, fontSize: 13, outline: "none" }} />
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 16, flexShrink: 0 }}>
+          <div style={{ fontSize: 11, color: saveState === "idle" ? "transparent" : COLORS.inkSoft, display: "flex", alignItems: "center", gap: 5, minWidth: 90, justifyContent: "flex-end" }}>
+            {saveState === "saving" && (<><Loader2 size={11} className="spin" /> Guardando…</>)}
+            {saveState === "saved" && (<><Check size={12} color="#1F9D55" /> Sincronizado</>)}
+          </div>
+          <Bell size={17} color={COLORS.inkSoft} style={{ cursor: "pointer" }} />
+          <Settings size={17} color={COLORS.inkSoft} style={{ cursor: "pointer" }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 30, height: 30, borderRadius: "50%", background: COLORS.ink, color: "white", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              {(user.email || "?").slice(0, 1).toUpperCase()}
+            </div>
+            <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 500 }}>{(user.email || "").split("@")[0]}</div>
+          </div>
+          <LogOut size={17} color={COLORS.inkSoft} style={{ cursor: "pointer" }} onClick={handleLogout} title="Cerrar sesión" />
+        </div>
+      </div>
+
+      <div style={{ position: "relative", padding: "22px 26px 60px", maxWidth: 1400, margin: "0 auto" }}>
+        <div style={{ position: "absolute", right: 26, top: 22, zIndex: 20 }}>
+          <CompactCalendar projects={projects} selectedDate={selectedDate} onSelectDate={setSelectedDate} />
+        </div>
+
+        <div style={{ marginBottom: 18, maxWidth: 560 }}>
+          <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 21, color: COLORS.ink }}>Project Canvas</div>
+          <div style={{ fontSize: 13, color: COLORS.inkSoft, marginTop: 3 }}>
+            Arrastra una tarjeta para reorganizarla, o haz clic para abrir el detalle. {filtered.length} de {projects.length} proyectos · compartido con todo el equipo MOP.
+          </div>
+        </div>
+
+        {!loaded ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, color: COLORS.inkSoft, fontSize: 13, padding: 40 }}>
+            <Loader2 size={15} className="spin" /> Cargando proyectos…
+          </div>
+        ) : (
+          <div style={{ position: "relative", height: canvasHeight, background: "repeating-linear-gradient(0deg, transparent, transparent 39px, #F0EFEB 40px)", borderRadius: 20, border: `1px dashed ${COLORS.line}` }}>
+            {filtered.map((p) => (
+              <ProjectCapsule
+                key={p.id}
+                project={p}
+                taskCount={tasks.filter((t) => t.project_id === p.id).length}
+                onOpen={setOpenId}
+                onDrag={onDrag}
+                onDragEnd={onDragEnd}
+                dragging={dragging}
+              />
+            ))}
+            {filtered.length === 0 && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.inkSoft, fontSize: 13 }}>
+                {projects.length === 0 ? "Aún no hay proyectos. Crea el primero con el botón +." : "No hay proyectos que coincidan con tu búsqueda."}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <button onClick={() => setShowNew(true)} title="Nuevo proyecto"
+        style={{ position: "fixed", right: 30, bottom: 30, width: 54, height: 54, borderRadius: "50%", background: COLORS.ink, color: "white", border: "none", boxShadow: "0 16px 32px -10px rgba(20,22,26,0.4)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 40 }}>
+        <Plus size={24} />
+      </button>
+
+      {openProject && (
+        <SidePanel
+          project={openProject}
+          tasks={tasks.filter((t) => t.project_id === openProject.id)}
+          checklist={checklist.filter((c) => c.project_id === openProject.id)}
+          comments={comments.filter((c) => c.project_id === openProject.id)}
+          files={files.filter((f) => f.project_id === openProject.id).map((f) => ({ ...f, url: fileUrl(f.storage_path) }))}
+          currentUserEmail={user.email}
+          onClose={() => setOpenId(null)}
+          onUpdateProject={onUpdateProject}
+          onAddTask={onAddTask}
+          onUpdateTask={onUpdateTask}
+          onAddChecklistItem={onAddChecklistItem}
+          onToggleChecklistItem={onToggleChecklistItem}
+          onAddComment={onAddComment}
+          onUploadFile={onUploadFile}
+        />
+      )}
+      {showNew && <NewProjectModal onClose={() => setShowNew(false)} onCreate={onCreateProject} />}
+    </div>
+  );
+}
